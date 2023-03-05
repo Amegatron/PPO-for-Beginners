@@ -12,6 +12,7 @@ from ppo import PPO
 from network import FeedForwardNN
 from eval_policy import eval_policy
 
+
 def train(env, hyperparameters, actor_model, critic_model):
 	"""
 		Trains the model.
@@ -47,6 +48,7 @@ def train(env, hyperparameters, actor_model, critic_model):
 	# you can kill the process whenever you feel like PPO is converging
 	model.learn(total_timesteps=200_000_000)
 
+
 def test(env, actor_model):
 	"""
 		Tests the model.
@@ -81,6 +83,7 @@ def test(env, actor_model):
 	# independently as a binary file that can be loaded in with torch.
 	eval_policy(policy=policy, env=env, render=True)
 
+
 def main(args):
 	"""
 		The main function to run.
@@ -96,7 +99,7 @@ def main(args):
 	# To see a list of hyperparameters, look in ppo.py at function _init_hyperparameters
 	hyperparameters = {
 				'timesteps_per_batch': 2048, 
-				'max_timesteps_per_episode': 200, 
+				'max_timesteps_per_episode': 500,
 				'gamma': 0.99, 
 				'n_updates_per_iteration': 10,
 				'lr': 3e-4, 
@@ -108,13 +111,14 @@ def main(args):
 	# Creates the environment we'll be running. If you want to replace with your own
 	# custom environment, note that it must inherit Gym and have both continuous
 	# observation and action spaces.
-	env = gym.make('Pendulum-v0')
+	env = gym.make('BipedalWalker-v3')
 
 	# Train or test, depending on the mode specified
 	if args.mode == 'train':
 		train(env=env, hyperparameters=hyperparameters, actor_model=args.actor_model, critic_model=args.critic_model)
 	else:
 		test(env=env, actor_model=args.actor_model)
+
 
 if __name__ == '__main__':
 	args = get_args() # Parse arguments from command line

@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.optim import Adam
 from torch.distributions import MultivariateNormal
 
+
 class PPO:
 	"""
 		This is the PPO class we will use as our model in main.py
@@ -42,8 +43,15 @@ class PPO:
 		self.obs_dim = env.observation_space.shape[0]
 		self.act_dim = env.action_space.shape[0]
 
-		 # Initialize actor and critic networks
-		self.actor = policy_class(self.obs_dim, self.act_dim)                                                   # ALG STEP 1
+		if torch.cuda.is_available():
+			self.device = torch.cuda.current_device()
+			print("CUDA is available. Using device \'%s\'" % torch.cuda.get_device_name(self.device))
+		else:
+			self.device = torch.device('cpu')
+			print("CUDA is NOT available, using CPU (training will be slow)")
+
+		# Initialize actor and critic networks
+		self.actor = policy_class(self.obs_dim, self.act_dim)
 		self.critic = policy_class(self.obs_dim, 1)
 
 		# Initialize optimizers for actor and critic
@@ -94,7 +102,7 @@ class PPO:
 
 			# Calculate advantage at k-th iteration
 			V, _ = self.evaluate(batch_obs, batch_acts)
-			A_k = batch_rtgs - V.detach()                                                                       # ALG STEP 5
+			A_k = batch_rtgs - V.detach()
 
 			# One of the only tricks I use that isn't in the pseudocode. Normalizing advantages
 			# isn't theoretically necessary, but in practice it decreases the variance of 
@@ -179,6 +187,10 @@ class PPO:
 		t = 0 # Keeps track of how many timesteps we've run so far this batch
 
 		# Keep simulating until we've run more than or equal to specified timesteps per batch
+
+		# self.actor.to(torch.device("cpu"))
+		# self.critic.to(torch.device("cpu"))
+
 		while t < self.timesteps_per_batch:
 			ep_rews = [] # rewards collected per episode
 
@@ -189,7 +201,8 @@ class PPO:
 			# Run an episode for a maximum of max_timesteps_per_episode timesteps
 			for ep_t in range(self.max_timesteps_per_episode):
 				# If render is specified, render the environment
-				if self.render and (self.logger['i_so_far'] % self.render_every_i == 0) and len(batch_lens) == 0:
+				if self.render and (self.logger['i_so_far'] % self.render_every_i == 0) \
+						and len(batch_lens) == 0 and (self.logger['i_so_far'] >= 30):
 					self.env.render()
 
 				t += 1 # Increment timesteps ran this batch so far
@@ -199,6 +212,7 @@ class PPO:
 
 				# Calculate action and make a step in the env. 
 				# Note that rew is short for reward.
+				# print("Taking action")
 				action, log_prob = self.get_action(obs)
 				obs, rew, done, _ = self.env.step(action)
 
@@ -283,7 +297,7 @@ class PPO:
 		log_prob = dist.log_prob(action)
 
 		# Return the sampled action and the log probability of that action in our distribution
-		return action.detach().numpy(), log_prob.detach()
+		return action.detach().cpu().numpy(), log_prob.detach()
 
 	def evaluate(self, batch_obs, batch_acts):
 		"""
@@ -301,18 +315,28 @@ class PPO:
 				V - the predicted values of batch_obs
 				log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
 		"""
+		actor = self.actor.to(self.device)
+		critic = self.critic.to(self.device)
+
+		obs_cuda = batch_obs.to(self.device)
+		acts_cuda = batch_acts.to(self.device)
+
 		# Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
-		V = self.critic(batch_obs).squeeze()
+		V = critic(obs_cuda).squeeze()
 
 		# Calculate the log probabilities of batch actions using most recent actor network.
 		# This segment of code is similar to that in get_action()
-		mean = self.actor(batch_obs)
-		dist = MultivariateNormal(mean, self.cov_mat)
-		log_probs = dist.log_prob(batch_acts)
+
+		mean = actor(obs_cuda)
+		dist = MultivariateNormal(mean, self.cov_mat.to(self.device))
+		log_probs = dist.log_prob(acts_cuda)
+
+		# batch_obs.to(torch.device("cpu"))
+		# batch_acts.to(torch.device("cpu"))
 
 		# Return the value vector V of each observation in the batch
 		# and log probabilities log_probs of each action in the batch
-		return V, log_probs
+		return V.cpu(), log_probs.cpu()
 
 	def _init_hyperparameters(self, hyperparameters):
 		"""
@@ -375,7 +399,7 @@ class PPO:
 		i_so_far = self.logger['i_so_far']
 		avg_ep_lens = np.mean(self.logger['batch_lens'])
 		avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in self.logger['batch_rews']])
-		avg_actor_loss = np.mean([losses.float().mean() for losses in self.logger['actor_losses']])
+		avg_actor_loss = np.mean([losses.float().cpu().mean() for losses in self.logger['actor_losses']])
 
 		# Round decimal places for more aesthetic logging messages
 		avg_ep_lens = str(round(avg_ep_lens, 2))
