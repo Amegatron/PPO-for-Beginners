@@ -1,3 +1,9 @@
+> **Aim of this fork**
+>
+> This fork mainly adds support of GPU computing (CUDA) at training stage. It also changes the rollout part of the process
+> to be multithreaded (WIP).
+> So, this fork is mainly just a playground for myself around multithreading, GPU computing, and perhaps some other things
+
 # PPO for Beginners
 
 ## Introduction
