@@ -43,6 +43,8 @@ class PPO:
 		self.obs_dim = env.observation_space.shape[0]
 		self.act_dim = env.action_space.shape[0]
 
+		self.device_cpu = torch.device("cpu")
+
 		if torch.cuda.is_available():
 			self.device = torch.cuda.current_device()
 			print("CUDA is available. Using device \'%s\'" % torch.cuda.get_device_name(self.device))
@@ -72,6 +74,8 @@ class PPO:
 			'actor_losses': [],     # losses of actor network in current iteration
 		}
 
+		self.start_render = False
+
 	def learn(self, total_timesteps):
 		"""
 			Train the actor and critic networks. Here is where the main PPO algorithm resides.
@@ -100,8 +104,14 @@ class PPO:
 			self.logger['t_so_far'] = t_so_far
 			self.logger['i_so_far'] = i_so_far
 
+			self.actor.to(self.device)
+			self.critic.to(self.device)
+
+			obs_cuda = batch_obs.to(self.device)
+			acts_cuda = batch_acts.to(self.device)
+
 			# Calculate advantage at k-th iteration
-			V, _ = self.evaluate(batch_obs, batch_acts)
+			V, _ = self.evaluate(obs_cuda, acts_cuda)
 			A_k = batch_rtgs - V.detach()
 
 			# One of the only tricks I use that isn't in the pseudocode. Normalizing advantages
@@ -113,7 +123,7 @@ class PPO:
 			# This is the loop where we update our network for some n epochs
 			for _ in range(self.n_updates_per_iteration):                                                       # ALG STEP 6 & 7
 				# Calculate V_phi and pi_theta(a_t | s_t)
-				V, curr_log_probs = self.evaluate(batch_obs, batch_acts)
+				V, curr_log_probs = self.evaluate(obs_cuda, acts_cuda)
 
 				# Calculate the ratio pi_theta(a_t | s_t) / pi_theta_k(a_t | s_t)
 				# NOTE: we just subtract the logs, which is the same as
@@ -147,6 +157,9 @@ class PPO:
 
 				# Log actor loss
 				self.logger['actor_losses'].append(actor_loss.detach())
+
+			self.actor.to(self.device_cpu)
+			self.critic.to(self.device_cpu)
 
 			# Print a summary of our training so far
 			self._log_summary()
@@ -198,11 +211,13 @@ class PPO:
 			obs = self.env.reset()
 			done = False
 
+			ep_r = 0
 			# Run an episode for a maximum of max_timesteps_per_episode timesteps
 			for ep_t in range(self.max_timesteps_per_episode):
 				# If render is specified, render the environment
 				if self.render and (self.logger['i_so_far'] % self.render_every_i == 0) \
-						and len(batch_lens) == 0 and (self.logger['i_so_far'] >= 30):
+						and len(batch_lens) == 0 and (self.logger['i_so_far'] >= 30) \
+						and self.start_render:
 					self.env.render()
 
 				t += 1 # Increment timesteps ran this batch so far
@@ -218,6 +233,7 @@ class PPO:
 
 				# Track recent reward, action, and action log probability
 				ep_rews.append(rew)
+				ep_r += rew
 				batch_acts.append(action)
 				batch_log_probs.append(log_prob)
 
@@ -225,11 +241,14 @@ class PPO:
 				if done:
 					break
 
+			if ep_r > 70:
+				self.start_render = True
 			# Track episodic lengths and rewards
 			batch_lens.append(ep_t + 1)
 			batch_rews.append(ep_rews)
 
 		# Reshape data as tensors in the shape specified in function description, before returning
+		batch_obs = np.array(batch_obs)
 		batch_obs = torch.tensor(batch_obs, dtype=torch.float)
 		batch_acts = torch.tensor(batch_acts, dtype=torch.float)
 		batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
@@ -315,21 +334,15 @@ class PPO:
 				V - the predicted values of batch_obs
 				log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
 		"""
-		actor = self.actor.to(self.device)
-		critic = self.critic.to(self.device)
-
-		obs_cuda = batch_obs.to(self.device)
-		acts_cuda = batch_acts.to(self.device)
-
 		# Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
-		V = critic(obs_cuda).squeeze()
+		V = self.critic(batch_obs).squeeze()
 
 		# Calculate the log probabilities of batch actions using most recent actor network.
 		# This segment of code is similar to that in get_action()
 
-		mean = actor(obs_cuda)
+		mean = self.actor(batch_obs)
 		dist = MultivariateNormal(mean, self.cov_mat.to(self.device))
-		log_probs = dist.log_prob(acts_cuda)
+		log_probs = dist.log_prob(batch_acts)
 
 		# batch_obs.to(torch.device("cpu"))
 		# batch_acts.to(torch.device("cpu"))
