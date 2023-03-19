@@ -5,8 +5,8 @@
 """
 
 import gym
-import time
 
+import multiprocessing as mp
 import numpy as np
 import time
 import torch
@@ -74,7 +74,33 @@ class PPO:
 			'actor_losses': [],     # losses of actor network in current iteration
 		}
 
-		self.start_render = False
+		self.renderer_process = None
+
+	def render_env(self, env, queue, max_steps=2000):
+		stop = False
+
+		actor = queue.get()
+
+		while not stop:
+			try:
+				tmp_actor = queue.get_nowait()
+			except:
+				tmp_actor = None
+
+			if tmp_actor is not None:
+				actor = tmp_actor
+
+			obs = env.reset()
+			done = False
+
+			steps = 0
+			ep_r = 0
+			while not done and steps < max_steps and ep_r > -10:
+				env.render()
+				action = actor(obs).detach().numpy()
+				obs, rew, done, _ = env.step(action)
+				ep_r += rew
+				steps += 1
 
 	def learn(self, total_timesteps):
 		"""
@@ -86,6 +112,14 @@ class PPO:
 			Return:
 				None
 		"""
+		queue = mp.Queue(1)
+
+		print("Launching render thread...")
+		self.renderer_process = mp.Process(
+			target=self.render_env, args=[self.env, queue]
+		)
+		self.renderer_process.start()
+
 		print(f"Learning... Running {self.max_timesteps_per_episode} timesteps per episode, ", end='')
 		print(f"{self.timesteps_per_batch} timesteps per batch for a total of {total_timesteps} timesteps")
 		t_so_far = 0 # Timesteps simulated so far
@@ -161,6 +195,13 @@ class PPO:
 			self.actor.to(self.device_cpu)
 			self.critic.to(self.device_cpu)
 
+			try:
+				tmp_actor = queue.get_nowait()
+			except:
+				pass
+
+			queue.put(self.actor)
+
 			# Print a summary of our training so far
 			self._log_summary()
 
@@ -215,10 +256,6 @@ class PPO:
 			# Run an episode for a maximum of max_timesteps_per_episode timesteps
 			for ep_t in range(self.max_timesteps_per_episode):
 				# If render is specified, render the environment
-				if self.render and (self.logger['i_so_far'] % self.render_every_i == 0) \
-						and len(batch_lens) == 0 and (self.logger['i_so_far'] >= 30) \
-						and self.start_render:
-					self.env.render()
 
 				t += 1 # Increment timesteps ran this batch so far
 
@@ -241,8 +278,6 @@ class PPO:
 				if done:
 					break
 
-			if ep_r > 70:
-				self.start_render = True
 			# Track episodic lengths and rewards
 			batch_lens.append(ep_t + 1)
 			batch_rews.append(ep_rews)
