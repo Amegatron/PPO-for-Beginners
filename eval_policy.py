@@ -5,6 +5,8 @@
 	which resides in ppo.py. Thus, we can test our trained policy without 
 	relying on ppo.py.
 """
+import numpy as np
+
 
 def _log_summary(ep_len, ep_ret, ep_num):
 		"""
@@ -28,7 +30,7 @@ def _log_summary(ep_len, ep_ret, ep_num):
 		print(f"------------------------------------------------------", flush=True)
 		print(flush=True)
 
-def rollout(policy, env, render):
+def rollout(policy, env, render, steps):
 	"""
 		Returns a generator to roll out each episode given a trained policy and
 		environment to test on. 
@@ -59,6 +61,7 @@ def rollout(policy, env, render):
 		# Logging data
 		ep_len = 0            # episodic length
 		ep_ret = 0            # episodic return
+		batch_obs = [obs]
 
 		while not done:
 			t += 1
@@ -67,9 +70,19 @@ def rollout(policy, env, render):
 			if render:
 				env.render()
 
+			if len(batch_obs) >= steps:
+				obs_step = batch_obs[-steps:]
+			else:
+				obs_step = batch_obs[:]
+
+				while len(obs_step) < steps:
+					obs_step[:0] = [batch_obs[0]]
+
+			obs_step = np.array(obs_step)
+
 			# Query deterministic action from policy and run it
-			action = policy(obs).detach().numpy()
-			obs, rew, done, _ = env.step(action)
+			action = policy(obs_step).detach().numpy()
+			obs, rew, done, _ = env.step(action[0])
 
 			# Sum all episodic rewards as we go along
 			ep_ret += rew
@@ -80,7 +93,7 @@ def rollout(policy, env, render):
 		# returns episodic length and return in this iteration
 		yield ep_len, ep_ret
 
-def eval_policy(policy, env, render=False):
+def eval_policy(policy, env, steps, render=False):
 	"""
 		The main function to evaluate our policy with. It will iterate a generator object
 		"rollout", which will simulate each episode and return the most recent episode's
@@ -98,5 +111,5 @@ def eval_policy(policy, env, render=False):
 		NOTE: To learn more about generators, look at rollout's function description
 	"""
 	# Rollout with the policy and environment, and log each episode's data
-	for ep_num, (ep_len, ep_ret) in enumerate(rollout(policy, env, render)):
+	for ep_num, (ep_len, ep_ret) in enumerate(rollout(policy, env, render, steps)):
 		_log_summary(ep_len=ep_len, ep_ret=ep_ret, ep_num=ep_num)

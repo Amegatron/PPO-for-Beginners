@@ -3,6 +3,7 @@
 	NOTE: All "ALG STEP"s are following the numbers from the original PPO pseudocode.
 			It can be found here: https://spinningup.openai.com/en/latest/_images/math/e62a8971472597f4b014c2da064f636ffe365ba3.svg
 """
+from collections import deque
 
 import gym
 
@@ -19,7 +20,7 @@ class PPO:
 	"""
 		This is the PPO class we will use as our model in main.py
 	"""
-	def __init__(self, policy_class, env, **hyperparameters):
+	def __init__(self, policy_class, state_encoder, env, **hyperparameters):
 		"""
 			Initializes the PPO model, including hyperparameters.
 
@@ -32,16 +33,18 @@ class PPO:
 				None
 		"""
 		# Make sure the environment is compatible with our code
-		assert(type(env.observation_space) == gym.spaces.Box)
-		assert(type(env.action_space) == gym.spaces.Box)
+		assert(type(env.base_env.observation_space) == gym.spaces.Box)
+		assert(type(env.base_env.action_space) == gym.spaces.Box)
+
+		self.steps = env.steps
 
 		# Initialize hyperparameters for training with PPO
 		self._init_hyperparameters(hyperparameters)
 
 		# Extract environment information
 		self.env = env
-		self.obs_dim = env.observation_space.shape[0]
-		self.act_dim = env.action_space.shape[0]
+		self.obs_dim = env.base_env.observation_space.shape[0]
+		self.act_dim = env.base_env.action_space.shape[0]
 
 		self.device_cpu = torch.device("cpu")
 
@@ -53,8 +56,8 @@ class PPO:
 			print("CUDA is NOT available, using CPU (training will be slow)")
 
 		# Initialize actor and critic networks
-		self.actor = policy_class(self.obs_dim, self.act_dim)
-		self.critic = policy_class(self.obs_dim, 1)
+		self.actor = policy_class(self.obs_dim, 0, self.act_dim, state_encoder=state_encoder, steps=self.steps)
+		self.critic = policy_class(self.obs_dim, self.act_dim, 1, state_encoder=state_encoder, steps=self.steps)
 
 		# Initialize optimizers for actor and critic
 		self.actor_optim = Adam(self.actor.parameters(), lr=self.lr)
@@ -63,6 +66,10 @@ class PPO:
 		# Initialize the covariance matrix used to query the actor for actions
 		self.cov_var = torch.full(size=(self.act_dim,), fill_value=0.5)
 		self.cov_mat = torch.diag(self.cov_var)
+
+		# This mat is needed for batch evaluation. And due to some peculiarities, it also needs
+		# to have the batch dimension, equal to the mean batch-size. Expanded on fly.
+		self.cov_mat_cuda = self.cov_mat.detach().to(self.device)
 
 		# This logger will help us with printing out summaries of each iteration
 		self.logger = {
@@ -79,23 +86,17 @@ class PPO:
 	def render_env(self, env, queue, max_steps=2000):
 		stop = False
 
-		actor = queue.get()
+		# Dirty workaround, because env became non-picklable for some reason
 
 		while not stop:
-			try:
-				tmp_actor = queue.get_nowait()
-			except:
-				tmp_actor = None
-
-			if tmp_actor is not None:
-				actor = tmp_actor
+			actor = queue.get()
 
 			obs = env.reset()
 			done = False
 
 			steps = 0
 			ep_r = 0
-			while not done and steps < max_steps and ep_r > -10:
+			while not done and steps < max_steps and ep_r > -30:
 				env.render()
 				action = actor(obs).detach().numpy()
 				obs, rew, done, _ = env.step(action)
@@ -113,12 +114,13 @@ class PPO:
 				None
 		"""
 		queue = mp.Queue(1)
+		queue.put(self.actor)
 
 		print("Launching render thread...")
-		self.renderer_process = mp.Process(
-			target=self.render_env, args=[self.env, queue]
-		)
-		self.renderer_process.start()
+		# self.renderer_process = mp.Process(
+		# 	target=self.render_env, args=[self.env, queue]
+		# )
+		# self.renderer_process.start()
 
 		print(f"Learning... Running {self.max_timesteps_per_episode} timesteps per episode, ", end='')
 		print(f"{self.timesteps_per_batch} timesteps per batch for a total of {total_timesteps} timesteps")
@@ -126,7 +128,10 @@ class PPO:
 		i_so_far = 0 # Iterations ran so far
 		while t_so_far < total_timesteps:                                                                       # ALG STEP 2
 			# Autobots, roll out (just kidding, we're collecting our batch simulations here)
-			batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens = self.rollout()                     # ALG STEP 3
+			rollout_start = time.time_ns()
+			self.actor.eval()
+			batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens = self.rollout()    # ALG STEP 3
+			self.logger['rollout_time'] = time.time_ns() - rollout_start
 
 			# Calculate how many timesteps we collected this batch
 			t_so_far += np.sum(batch_lens)
@@ -140,6 +145,7 @@ class PPO:
 
 			self.actor.to(self.device)
 			self.critic.to(self.device)
+			self.actor.train()
 
 			obs_cuda = batch_obs.to(self.device)
 			acts_cuda = batch_acts.to(self.device)
@@ -153,6 +159,8 @@ class PPO:
 			# our advantages and makes convergence much more stable and faster. I added this because
 			# solving some environments was too unstable without it.
 			A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+
+			train_start = time.time_ns()
 
 			# This is the loop where we update our network for some n epochs
 			for _ in range(self.n_updates_per_iteration):                                                       # ALG STEP 6 & 7
@@ -194,6 +202,9 @@ class PPO:
 
 			self.actor.to(self.device_cpu)
 			self.critic.to(self.device_cpu)
+			self.actor.eval()
+
+			self.logger['train_time'] = time.time_ns() - train_start
 
 			try:
 				tmp_actor = queue.get_nowait()
@@ -238,7 +249,7 @@ class PPO:
 		# upon each new episode
 		ep_rews = []
 
-		t = 0 # Keeps track of how many timesteps we've run so far this batch
+		t = 0  # Keeps track of how many timesteps we've run so far this batch
 
 		# Keep simulating until we've run more than or equal to specified timesteps per batch
 
@@ -250,6 +261,7 @@ class PPO:
 
 			# Reset the environment. sNote that obs is short for observation. 
 			obs = self.env.reset()
+
 			done = False
 
 			ep_r = 0
@@ -262,9 +274,10 @@ class PPO:
 				# Track observations in this batch
 				batch_obs.append(obs)
 
-				# Calculate action and make a step in the env. 
+				# Calculate action and make a step in the env.
 				# Note that rew is short for reward.
 				# print("Taking action")
+				# action, log_prob = self.get_action(obs)
 				action, log_prob = self.get_action(obs)
 				obs, rew, done, _ = self.env.step(action)
 
@@ -285,7 +298,7 @@ class PPO:
 		# Reshape data as tensors in the shape specified in function description, before returning
 		batch_obs = np.array(batch_obs)
 		batch_obs = torch.tensor(batch_obs, dtype=torch.float)
-		batch_acts = torch.tensor(batch_acts, dtype=torch.float)
+		batch_acts = torch.tensor(np.array(batch_acts), dtype=torch.float)
 		batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
 		batch_rtgs = self.compute_rtgs(batch_rews)                                                              # ALG STEP 4
 
@@ -339,6 +352,8 @@ class PPO:
 		# Query the actor network for a mean action
 		mean = self.actor(obs)
 
+		# TODO: probably, better would be to do batch probs-calculation before actor update?
+
 		# Create a distribution with the mean action and std from the covariance matrix above.
 		# For more information on how this distribution works, check out Andrew Ng's lecture on it:
 		# https://www.youtube.com/watch?v=JjB58InuTqM
@@ -351,7 +366,7 @@ class PPO:
 		log_prob = dist.log_prob(action)
 
 		# Return the sampled action and the log probability of that action in our distribution
-		return action.detach().cpu().numpy(), log_prob.detach()
+		return action.detach().numpy(), log_prob.detach()
 
 	def evaluate(self, batch_obs, batch_acts):
 		"""
@@ -370,13 +385,14 @@ class PPO:
 				log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
 		"""
 		# Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
-		V = self.critic(batch_obs).squeeze()
+		V = self.critic(batch_obs, batch_acts).squeeze()
 
 		# Calculate the log probabilities of batch actions using most recent actor network.
 		# This segment of code is similar to that in get_action()
 
 		mean = self.actor(batch_obs)
-		dist = MultivariateNormal(mean, self.cov_mat.to(self.device))
+		# dist = MultivariateNormal(mean, self.cov_mat_cuda.unsqueeze(0).repeat(mean.shape[0], 1, 1))
+		dist = MultivariateNormal(mean, self.cov_mat_cuda)
 		log_probs = dist.log_prob(batch_acts)
 
 		# batch_obs.to(torch.device("cpu"))
@@ -442,11 +458,15 @@ class PPO:
 		self.logger['delta_t'] = time.time_ns()
 		delta_t = (self.logger['delta_t'] - delta_t) / 1e9
 		delta_t = str(round(delta_t, 2))
+		rollout_t = str(round(self.logger['rollout_time'] / 1e9, 2))
+		train_t = str(round(self.logger['train_time'] / 1e9, 2))
 
 		t_so_far = self.logger['t_so_far']
 		i_so_far = self.logger['i_so_far']
 		avg_ep_lens = np.mean(self.logger['batch_lens'])
-		avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in self.logger['batch_rews']])
+		ep_sum_rews = [np.sum(ep_rews) for ep_rews in self.logger['batch_rews']]
+		avg_ep_rews = np.mean(ep_sum_rews)
+		max_ep_rew = np.max(ep_sum_rews)
 		avg_actor_loss = np.mean([losses.float().cpu().mean() for losses in self.logger['actor_losses']])
 
 		# Round decimal places for more aesthetic logging messages
@@ -459,9 +479,10 @@ class PPO:
 		print(f"-------------------- Iteration #{i_so_far} --------------------", flush=True)
 		print(f"Average Episodic Length: {avg_ep_lens}", flush=True)
 		print(f"Average Episodic Return: {avg_ep_rews}", flush=True)
+		print(f"Maximum Episodic Return: {max_ep_rew}", flush=True)
 		print(f"Average Loss: {avg_actor_loss}", flush=True)
 		print(f"Timesteps So Far: {t_so_far}", flush=True)
-		print(f"Iteration took: {delta_t} secs", flush=True)
+		print(f"Iteration took: {delta_t} secs (rollout: {rollout_t}, train: {train_t})", flush=True)
 		print(f"------------------------------------------------------", flush=True)
 		print(flush=True)
 
@@ -469,3 +490,7 @@ class PPO:
 		self.logger['batch_lens'] = []
 		self.logger['batch_rews'] = []
 		self.logger['actor_losses'] = []
+
+
+if __name__ == '__main__':
+	exit(1)
